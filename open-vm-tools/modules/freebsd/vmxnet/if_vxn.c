@@ -24,6 +24,16 @@
 #include <sys/kernel.h>
 #include <sys/socket.h>
 #include <sys/systm.h>
+#include <sys/sysctl.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/ip6.h>
+#include <netinet/tcp.h>
+
+#define CO_DO_ZERO_COPY
+#define CO_DO_TSO
+#define CO_USE_TICK
+#define CO_USE_NEW_ALTQ
 
 /*
  * FreeBSD 5.3 introduced an MP-safe (multiprocessor-safe) network stack.
@@ -88,9 +98,14 @@
 #include "vm_device_version.h"
 #include "net_compat.h"
 
+
 #define VMXNET_ID_STRING "VMware PCI Ethernet Adpater"
 #define CRC_POLYNOMIAL_LE 0xedb88320UL  /* Ethernet CRC, little endian */
 #define ETHER_ALIGN  2
+#define VMXNET_MIN_MTU                  (ETHERMIN - 14)
+#define VMXNET_MAX_MTU                  (16 * 1024 - 18)
+#define VMXNET_CSUM_FEATURES            (CSUM_TCP | CSUM_UDP)
+   
 
 /* number of milliseconds to wait for pending transmits to complete on stop */
 #define MAX_TX_WAIT_ON_STOP 2000
@@ -109,6 +124,9 @@ typedef struct vxn_softc {
 #ifdef VXN_MPSAFE
    struct mtx               vxn_mtx;
 #endif
+#ifdef CO_USE_TICK
+   struct callout           vxn_stat_ch;
+#endif
    struct resource         *vxn_io;
    bus_space_handle_t	    vxn_iobhandle;
    bus_space_tag_t	    vxn_iobtag;
@@ -116,16 +134,31 @@ typedef struct vxn_softc {
    void			   *vxn_intrhand;
    Vmxnet2_DriverData      *vxn_dd;
    uint32                   vxn_dd_phys;
+   int                      vxn_num_rx_max_bufs;
+   int                      vxn_num_rx_max_bufs2;
+   int                      vxn_num_tx_max_bufs;
    int                      vxn_num_rx_bufs;
+   int                      vxn_num_rx_bufs2;
    int                      vxn_num_tx_bufs;
    Vmxnet2_RxRingEntry     *vxn_rx_ring;
+   Vmxnet2_RxRingEntry     *vxn_rx_ring2;
    Vmxnet2_TxRingEntry     *vxn_tx_ring;
    int                      vxn_tx_pending;
    int                      vxn_rings_allocated;
    uint32                   vxn_max_tx_frags;
+   uint32                   vxn_zero_copy_tx;
+   boolean_t                vxn_chain_tx;
+   boolean_t                vxn_chain_rx;
+   uint32                   vxn_csum_tx_req_cnt;
+   uint32                   vxn_csum_rx_ok_cnt;
+   uint32                   vxn_capabilities;
+   uint32                   vxn_features;
 
-   struct mbuf             *vxn_tx_buffptr[VMXNET2_MAX_NUM_TX_BUFFERS];
-   struct mbuf             *vxn_rx_buffptr[VMXNET2_MAX_NUM_RX_BUFFERS];
+   int                      vxn_timer;
+
+   struct mbuf             *vxn_tx_buffptr[VMXNET2_MAX_NUM_TX_BUFFERS_TSO];
+   struct mbuf             *vxn_rx_buffptr[ENHANCED_VMXNET2_MAX_NUM_RX_BUFFERS];
+   struct mbuf             *vxn_rx_buffptr2[VMXNET2_MAX_NUM_RX_BUFFERS2];
 
 } vxn_softc_t;
 
@@ -133,10 +166,16 @@ typedef struct vxn_softc {
  * Driver entry points
  */
 static void vxn_init(void *);
+static void vxn_link_check( vxn_softc_t *sc );
 static void vxn_start(struct ifnet *);
 static int vxn_ioctl(struct ifnet *, u_long, caddr_t);
-#if __FreeBSD_version < 900000
+#ifdef CO_USE_TICK
 static void vxn_watchdog(struct ifnet *);
+static void vxn_tick(void *xsc);
+#else
+#  if __FreeBSD_version < 900000
+static void vxn_watchdog(struct ifnet *);
+#  endif
 #endif
 static void vxn_intr (void *);
 
@@ -170,6 +209,7 @@ static driver_t vxn_driver = {
 static devclass_t vxn_devclass;
 
 MODULE_DEPEND(if_vxn, pci, 1, 1, 1);
+MODULE_DEPEND(if_vxn, ether, 1, 1, 1);
 DRIVER_MODULE(if_vxn, pci, vxn_driver, vxn_devclass, 0, 0);
 
 /*
@@ -332,6 +372,12 @@ vxn_attach(device_t dev)
    u_int32_t vLow, vHigh;
    int driverDataSize;
    u_char mac[6];
+   u_int32_t features;
+   u_int32_t capabilities;
+   u_int32_t maxNumRxBuffers, defNumRxBuffers;
+   u_int32_t maxNumTxBuffers, defNumTxBuffers;
+   boolean_t enhanced = FALSE;
+   u_int32_t if_capabilities = 0;
 
    s = splimp();
 
@@ -347,6 +393,12 @@ vxn_attach(device_t dev)
    sc->vxn_tx_pending = 0;
    sc->vxn_rings_allocated = 0;
    sc->vxn_max_tx_frags = 1;
+   sc->vxn_chain_tx = FALSE;
+   sc->vxn_chain_rx = FALSE;
+   sc->vxn_zero_copy_tx = FALSE;
+   sc->vxn_timer = 0;
+   sc->vxn_csum_tx_req_cnt = 0;
+   sc->vxn_csum_rx_ok_cnt = 0;
 
    pci_enable_busmaster(dev);
 
@@ -418,26 +470,109 @@ vxn_attach(device_t dev)
       goto fail;
    }
 
+   capabilities = vxn_execute_4(sc, VMXNET_CMD_GET_CAPABILITIES);
+   features = vxn_execute_4(sc, VMXNET_CMD_GET_FEATURES);
+   sc->vxn_capabilities = capabilities;
+   sc->vxn_features = features;
+
+#ifdef CO_DO_ZERO_COPY
+   if( capabilities & VMNET_CAP_SG &&
+       features & VMXNET_FEATURE_ZERO_COPY_TX ) {
+      sc->vxn_zero_copy_tx = TRUE;
+
+      if (capabilities & VMNET_CAP_TX_CHAIN) {
+         sc->vxn_chain_tx = TRUE;
+      }
+
+      if (capabilities & VMNET_CAP_RX_CHAIN) {
+         sc->vxn_chain_rx = TRUE;
+      }
+
+      if( sc->vxn_chain_tx && sc->vxn_chain_rx
+       && (features & VMXNET_FEATURE_JUMBO_FRAME) ) {
+         if_capabilities |= IFCAP_JUMBO_MTU;
+      }
+   }
+
+#ifdef CO_DO_TSO
+   if ((capabilities & VMNET_CAP_TSO) &&
+     (capabilities & (VMNET_CAP_IP4_CSUM | VMNET_CAP_HW_CSUM)) &&
+     // tso only makes sense if we have hw csum offload
+     sc->vxn_chain_tx && sc->vxn_zero_copy_tx
+     && (features & VMXNET_FEATURE_TSO) ) {
+      if_capabilities |= IFCAP_TSO4;
+   }
+   if ((capabilities & VMNET_CAP_TSO6) &&
+     (capabilities & (VMNET_CAP_IP6_CSUM | VMNET_CAP_HW_CSUM)) &&
+     // tso only makes sense if we have hw csum offload
+     sc->vxn_chain_tx && sc->vxn_zero_copy_tx
+     && (features & VMXNET_FEATURE_TSO) ) {
+      if_capabilities |= IFCAP_TSO6;
+   }
+#endif
+#endif
+
+   if( capabilities & VMNET_CAP_IP4_CSUM) {
+      if_capabilities |= IFCAP_HWCSUM;
+   }
+   if( capabilities & VMNET_CAP_HW_CSUM) {
+      if_capabilities |= IFCAP_HWCSUM;
+   }
+
+   if( (features & VMXNET_FEATURE_TSO)
+    && (features & VMXNET_FEATURE_JUMBO_FRAME) ) {
+      enhanced = TRUE;
+   }
+
+   if( enhanced ) {
+      maxNumRxBuffers = ENHANCED_VMXNET2_MAX_NUM_RX_BUFFERS;
+      defNumRxBuffers = ENHANCED_VMXNET2_DEFAULT_NUM_RX_BUFFERS;
+   }
+   else {
+      maxNumRxBuffers = VMXNET2_MAX_NUM_RX_BUFFERS;
+      defNumRxBuffers = VMXNET2_DEFAULT_NUM_RX_BUFFERS;
+   }
+
+   if( if_capabilities & IFCAP_JUMBO_MTU ) {
+      maxNumTxBuffers = VMXNET2_MAX_NUM_TX_BUFFERS_TSO;
+      defNumTxBuffers = VMXNET2_DEFAULT_NUM_TX_BUFFERS_TSO;
+   }
+   else {
+      maxNumTxBuffers = VMXNET2_MAX_NUM_TX_BUFFERS;
+      defNumTxBuffers = VMXNET2_DEFAULT_NUM_TX_BUFFERS;
+   }
+
+
    /*
     * allocate and initialize our private and shared data structures
     */
    r = vxn_execute_4(sc, VMXNET_CMD_GET_NUM_RX_BUFFERS);
-   if (r == 0 || r > VMXNET2_MAX_NUM_RX_BUFFERS) {
-      r = VMXNET2_DEFAULT_NUM_RX_BUFFERS;
+   if (r == 0 || r > maxNumRxBuffers) {
+      r = defNumRxBuffers;
    }
-   sc->vxn_num_rx_bufs = r;
+   sc->vxn_num_rx_max_bufs = r;
+
+   if( if_capabilities & IFCAP_JUMBO_MTU ) {
+      r = sc->vxn_num_rx_max_bufs * 4;
+      if( r > VMXNET2_MAX_NUM_RX_BUFFERS2 ) {
+         r = VMXNET2_MAX_NUM_RX_BUFFERS2;
+      }
+   } else {
+      r = 1;
+   }
+   sc->vxn_num_rx_max_bufs2 = r;
 
    r = vxn_execute_4(sc, VMXNET_CMD_GET_NUM_TX_BUFFERS);
-   if (r == 0 || r > VMXNET2_MAX_NUM_TX_BUFFERS) {
-      r = VMXNET2_DEFAULT_NUM_TX_BUFFERS;
+   if (r == 0 || r > maxNumTxBuffers ) {
+      r = defNumTxBuffers;
    }
-   sc->vxn_num_tx_bufs = r;
+   sc->vxn_num_tx_max_bufs = r;
 
    driverDataSize =
       sizeof(Vmxnet2_DriverData) +
       /* numRxBuffers + 1 for the dummy rxRing2 (used only by Windows) */
-      (sc->vxn_num_rx_bufs + 1) * sizeof(Vmxnet2_RxRingEntry) +
-      sc->vxn_num_tx_bufs * sizeof(Vmxnet2_TxRingEntry);
+      (sc->vxn_num_rx_max_bufs + sc->vxn_num_rx_max_bufs2) * sizeof(Vmxnet2_RxRingEntry) +
+      sc->vxn_num_tx_max_bufs * sizeof(Vmxnet2_TxRingEntry);
 
    sc->vxn_dd = contigmalloc(driverDataSize, M_DEVBUF, M_NOWAIT,
                              0, 0xffffffff, PAGE_SIZE, 0);
@@ -453,6 +588,9 @@ vxn_attach(device_t dev)
    /* So that the vmkernel can check it is compatible */
    sc->vxn_dd->magic = VMXNET2_MAGIC;
    sc->vxn_dd->length = driverDataSize;
+   sc->vxn_dd->rxDriverNext = 0;
+   sc->vxn_dd->rxDriverNext2 = 0;
+   sc->vxn_dd->txDriverCur = sc->vxn_dd->txDriverNext = 0;
 
    /* This downcast is OK because we've asked for vxn_dd to fit in 32 bits */
    sc->vxn_dd_phys = (uint32)vtophys(sc->vxn_dd);
@@ -473,13 +611,29 @@ vxn_attach(device_t dev)
    ifp->if_ioctl = vxn_ioctl;
    ifp->if_output = ether_output;
    ifp->if_start = vxn_start;
-#if __FreeBSD_version < 900000
-   ifp->if_watchdog = vxn_watchdog;
-#endif
+//#if __FreeBSD_version < 900000
+//	ifp->if_watchdog = vxn_watchdog;
+//#endif
    ifp->if_init = vxn_init;
    ifp->if_baudrate = 1000000000;
-   ifp->if_snd.ifq_maxlen = sc->vxn_num_tx_bufs;
+#ifdef CO_USE_NEW_ALTQ
+   IFQ_SET_MAXLEN( &ifp->if_snd, sc->vxn_num_tx_max_bufs );
+   ifp->if_snd.ifq_drv_maxlen = sc->vxn_num_tx_max_bufs;
+   IFQ_SET_READY( &ifp->if_snd );
+#else
+   ifp->if_snd.ifq_maxlen = sc->vxn_num_tx_max_bufs;
+#endif
+   ifp->if_capabilities = if_capabilities;
    ifp->if_capenable = ifp->if_capabilities;
+   if( ifp->if_mtu <= ETHERMTU ) {
+      ifp->if_capenable &= ~IFCAP_JUMBO_MTU;
+   }
+   ifp->if_capenable &= ~IFCAP_TXCSUM;		// Hardware bug? Generated checksum is bad.
+   if( ifp->if_capenable & IFCAP_TXCSUM ) {
+      ifp->if_hwassist = VMXNET_CSUM_FEATURES;
+   } else {
+      ifp->if_hwassist = 0;
+   }
 
    /*
     * read the MAC address from the device
@@ -497,15 +651,33 @@ vxn_attach(device_t dev)
    bcopy(mac, sc->arpcom.ac_enaddr, 6);
 #endif
 
+   SYSCTL_ADD_UINT(device_get_sysctl_ctx(dev),
+       SYSCTL_CHILDREN(device_get_sysctl_tree(dev)),
+       OID_AUTO, "csum_tx_req", CTLFLAG_RD, &sc->vxn_csum_tx_req_cnt, 0, "Checksum offload TX count" );
+   SYSCTL_ADD_UINT( device_get_sysctl_ctx(dev),
+       SYSCTL_CHILDREN(device_get_sysctl_tree(dev)),
+       OID_AUTO, "csum_rx_ok", CTLFLAG_RD, &sc->vxn_csum_rx_ok_cnt, 0, "Checksum offload RX ok count" );
+   SYSCTL_ADD_UINT( device_get_sysctl_ctx(dev),
+       SYSCTL_CHILDREN(device_get_sysctl_tree(dev)),
+       OID_AUTO, "capabilities", CTLFLAG_RD, &sc->vxn_capabilities, 0, "HW capabilities" );
+   SYSCTL_ADD_UINT( device_get_sysctl_ctx(dev),
+       SYSCTL_CHILDREN(device_get_sysctl_tree(dev)),
+       OID_AUTO, "features", CTLFLAG_RD, &sc->vxn_features, 0, "HW features" );
+
    /*
     * success
     */
    VXN_ETHER_IFATTACH(ifp, mac);
-   printf("vxn%d: attached [num_rx_bufs=(%d*%d) num_tx_bufs=(%d*%d) driverDataSize=%d]\n",
+   printf("vxn%d: attached [num_rx_bufs=((%d+%u)*%d) num_tx_bufs=(%d*%d) driverDataSize=%d]\n",
           unit,
-          sc->vxn_num_rx_bufs, (int)sizeof(Vmxnet2_RxRingEntry),
-          sc->vxn_num_tx_bufs, (int)sizeof(Vmxnet2_TxRingEntry),
+          sc->vxn_num_rx_max_bufs, sc->vxn_num_rx_max_bufs2, (int)sizeof(Vmxnet2_RxRingEntry),
+          sc->vxn_num_tx_max_bufs, (int)sizeof(Vmxnet2_TxRingEntry),
           driverDataSize);
+
+#ifdef CO_USE_TICK
+   callout_init_mtx( &sc->vxn_stat_ch, &sc->vxn_mtx, 0 );
+#endif
+   vxn_link_check( sc );
 
    /*
     * Specify the media types supported by this adapter and register
@@ -574,6 +746,11 @@ vxn_detach(device_t dev)
    sc = device_get_softc(dev);
 
    ifp = VXN_SC2IFP(sc);
+
+#ifdef CO_USE_TICK
+   callout_drain( &sc->vxn_stat_ch );
+#endif
+
    if (device_is_attached(dev)) {
       vxn_stop(sc);
       /*
@@ -644,6 +821,10 @@ vxn_stopl(vxn_softc_t *sc)
       return;
    }
 
+#ifdef CO_USE_TICK
+   callout_stop(&sc->vxn_stat_ch);
+#endif
+
    /*
     * Disable device interrupts
     */
@@ -654,8 +835,8 @@ vxn_stopl(vxn_softc_t *sc)
     * Try to flush pending transmits
     */
    if (sc->vxn_tx_pending) {
-      printf("vxn%d: waiting for %d pending transmits\n",
-             VXN_IF_UNIT(ifp), sc->vxn_tx_pending);
+      if_printf( ifp, "waiting for %d pending transmits\n",
+             sc->vxn_tx_pending);
       for (i = 0; i < MAX_TX_WAIT_ON_STOP && sc->vxn_tx_pending; i++) {
          DELAY(1000);
          bus_space_write_4(sc->vxn_iobtag, sc->vxn_iobhandle,
@@ -663,8 +844,8 @@ vxn_stopl(vxn_softc_t *sc)
          vxn_tx_complete(sc);
       }
       if (sc->vxn_tx_pending) {
-         printf("vxn%d: giving up on %d pending transmits\n",
-                VXN_IF_UNIT(ifp), sc->vxn_tx_pending);
+         if_printf( ifp, "giving up on %d pending transmits\n",
+            	 sc->vxn_tx_pending);
       }
    }
 
@@ -788,7 +969,6 @@ vxn_init(void *v)
  *
  *-----------------------------------------------------------------------------
  */
-
 static void
 vxn_initl(vxn_softc_t *sc)
 {
@@ -804,7 +984,7 @@ vxn_initl(vxn_softc_t *sc)
       u_int32_t features;
 
       if (vxn_init_rings(sc) != 0) {
-         printf("vxn%d: ring intitialization failed\n", VXN_IF_UNIT(ifp));
+         if_printf( ifp, "ring intitialization failed\n" );
          return;
       }
 
@@ -842,7 +1022,7 @@ vxn_initl(vxn_softc_t *sc)
       r = bus_space_read_4(sc->vxn_iobtag, sc->vxn_iobhandle, VMXNET_INIT_LENGTH);
       if (!r) {
          vxn_release_rings(sc);
-         printf("vxn%d: device intitialization failed: %x\n", VXN_IF_UNIT(ifp), r);
+         if_printf( ifp, "device intitialization failed: %x\n", r );
          return;
       }
       capabilities = vxn_execute_4(sc, VMXNET_CMD_GET_CAPABILITIES);
@@ -863,7 +1043,7 @@ vxn_initl(vxn_softc_t *sc)
                     |VMXNET_IFF_MULTICAST);
 
    if (ifp->if_flags & IFF_PROMISC) {
-      printf("vxn%d: promiscuous mode enabled\n", VXN_IF_UNIT(ifp));
+      if_printf( ifp, "promiscuous mode enabled\n" );
       dd->ifflags |= VMXNET_IFF_PROMISC;
    }
    if (ifp->if_flags & IFF_BROADCAST) {
@@ -884,12 +1064,40 @@ vxn_initl(vxn_softc_t *sc)
 
    bus_space_write_4(sc->vxn_iobtag, sc->vxn_iobhandle,
 		     VMXNET_COMMAND_ADDR, VMXNET_CMD_UPDATE_IFF);
+
+#ifdef CO_USE_TICK
+   callout_reset( &sc->vxn_stat_ch, hz, vxn_tick, sc );
+#endif
+}
+
+static void
+vxn_link_check( vxn_softc_t *sc )
+{
+   struct ifnet *ifp = VXN_SC2IFP(sc);
+   uint32 stat;
+   int ok;
+   int link;
+
+   stat = bus_space_read_4( sc->vxn_iobtag, sc->vxn_iobhandle, VMXNET_STATUS_ADDR );
+   ok = ((stat & VMXNET_STATUS_CONNECTED) != 0);
+   link = ((ifp->if_link_state & LINK_STATE_UP) != 0);
+
+   if( !ok ) {
+      if( link ) {
+         if_link_state_change( ifp, LINK_STATE_DOWN );
+      }
+   } else {
+      if( !link ) {
+         if_link_state_change( ifp, LINK_STATE_UP );
+      }
+   }
 }
 
 /*
  *-----------------------------------------------------------------------------
  * vxn_encap --
  *     Stick packet address and length in given ring entry
+ *     パケットアドレスと長さを(送信)リングエントリに組む
  *
  * Results:
  *      0 on success, 1 on error
@@ -909,6 +1117,7 @@ vxn_encap(struct ifnet *ifp,
    vxn_softc_t *sc = ifp->if_softc;
    int frag = 0;
    struct mbuf *m;
+   vm_paddr_t sc_addr;
 
    xre->sg.length = 0;
    xre->flags = 0;
@@ -923,7 +1132,9 @@ vxn_encap(struct ifnet *ifp,
             break;
          }
 
-         xre->sg.sg[frag].addrLow = (uint32)vtophys(mtod(m, vm_offset_t));
+         sc_addr = vtophys(mtod(m, vm_offset_t));
+         xre->sg.sg[frag].addrLow = (uint32)(sc_addr & 0xFFFFFFFF);
+         xre->sg.sg[frag].addrHi = (uint16)(sc_addr >> 32);
          xre->sg.sg[frag].length = m->m_len;
          frag++;
       }
@@ -938,15 +1149,19 @@ vxn_encap(struct ifnet *ifp,
 
       MGETHDR(m_new, M_DONTWAIT, MT_DATA);
       if (m_new == NULL) {
-         printf("vxn%d: no memory for tx list\n", VXN_IF_UNIT(ifp));
+         if_printf( ifp, "no memory for tx list\n" );
          return 1;
       }
 
       if (m_head->m_pkthdr.len > MHLEN) {
-         MCLGET(m_new, M_DONTWAIT);
+         if( ifp->if_capenable & IFCAP_JUMBO_MTU ) {
+            m_cljget(m_new, M_NOWAIT, MJUM9BYTES);
+         } else {
+            MCLGET(m_new, M_NOWAIT);
+         }
          if (!(m_new->m_flags & M_EXT)) {
             m_freem(m_new);
-            printf("vxn%d: no memory for tx list\n", VXN_IF_UNIT(ifp));
+            if_printf( ifp, "no memory for tx list\n" );
             return 1;
          }
       }
@@ -954,13 +1169,23 @@ vxn_encap(struct ifnet *ifp,
       m_copydata(m_head, 0, m_head->m_pkthdr.len,
           mtod(m_new, caddr_t));
       m_new->m_pkthdr.len = m_new->m_len = m_head->m_pkthdr.len;
+#ifdef CO_USE_NEW_ALTQ
+      IFQ_DEQUEUE_NOLOCK( &ifp->if_snd, m_head );
+#endif
       m_freem(m_head);
       m_head = m_new;
 
-      xre->sg.sg[0].addrLow = (uint32)vtophys(mtod(m_head, vm_offset_t));
+      sc_addr = vtophys(mtod(m_head, vm_offset_t));
+      xre->sg.sg[0].addrLow = (uint32)(sc_addr & 0xFFFFFFFF);
+      xre->sg.sg[0].addrHi = (uint16)(sc_addr >> 32);
       xre->sg.sg[0].length = m_head->m_pkthdr.len;
       frag = 1;
    }
+#ifdef CO_USE_NEW_ALTQ
+   else {
+      IFQ_DEQUEUE_NOLOCK( &ifp->if_snd, m_head );
+   }
+#endif
 
    xre->sg.length = frag;
 
@@ -968,8 +1193,11 @@ vxn_encap(struct ifnet *ifp,
     * Mark ring entry as "NIC owned"
     */
    if (frag > 0) {
-      if (m_head->m_pkthdr.csum_flags & (CSUM_TCP | CSUM_UDP)) {
-         xre->flags |= VMXNET2_TX_HW_XSUM;
+      if( ifp->if_capenable & IFCAP_TXCSUM ) {
+         if (m_head->m_pkthdr.csum_flags & (CSUM_TCP | CSUM_UDP)) {
+            xre->flags |= VMXNET2_TX_HW_XSUM;
+            sc->vxn_csum_tx_req_cnt++;
+         }
       }
       xre->sg.addrType = NET_SG_PHYS_ADDR;
       *pbuffptr = m_head;
@@ -1003,6 +1231,62 @@ vxn_start(struct ifnet *ifp)
    VXN_UNLOCK((vxn_softc_t *)ifp->if_softc);
 }
 
+#ifdef CO_DO_TSO
+static int
+vxn_get_hdrlen( struct ifnet *ifp, struct mbuf *m )
+{
+   u_int32_t hdr_len = 0;
+
+   struct ether_header hdr_eth;
+   struct ip hdr_ip;
+   struct ip6_hdr hdr_ip6;
+   struct tcphdr hdr_tcp;
+
+   hdr_len += ETHER_HDR_LEN;
+   if( m->m_pkthdr.len < hdr_len ) {
+      return 0;
+   }
+
+   m_copydata( m, 0, sizeof(struct ether_header), (caddr_t)(&hdr_eth) );
+   if( (hdr_eth.ether_type & ETHERTYPE_IP)
+    && (ifp->if_capenable & IFCAP_TSO4) ) {
+      if( m->m_pkthdr.len < (hdr_len + sizeof(struct ip)) ) {
+         return hdr_len;
+      }
+
+      m_copydata( m, hdr_len, sizeof(struct ip), (caddr_t)(&hdr_ip) );
+      hdr_len += hdr_ip.ip_hl << 2;
+      if( hdr_ip.ip_p != IPPROTO_TCP ) { // exclude TCP
+         return hdr_len;
+      }
+
+      if( m->m_pkthdr.len < (hdr_len + sizeof(struct tcphdr)) ) {
+         return hdr_len;
+      }
+
+      m_copydata( m, hdr_len, sizeof(struct tcphdr), (caddr_t)(&hdr_tcp) );
+      hdr_len += hdr_tcp.th_off << 2;
+   } else
+   if( (hdr_eth.ether_type & ETHERTYPE_IPV6)
+    && (ifp->if_capenable & IFCAP_TSO6) ) {
+      if( m->m_pkthdr.len < (hdr_len + sizeof(struct ip6_hdr)) ) {
+         return hdr_len;
+      }
+
+      m_copydata( m, hdr_len, sizeof(struct ip6_hdr), (caddr_t)(&hdr_ip6) );
+      hdr_len = m->m_pkthdr.len - hdr_ip6.ip6_plen;
+      if( hdr_ip6.ip6_nxt != IPPROTO_TCP ) { // exclude TCP
+         return hdr_len;
+      }
+
+      m_copydata( m, hdr_len, sizeof(struct tcphdr), (caddr_t)(&hdr_tcp) );
+      hdr_len += hdr_tcp.th_off << 2;
+   }
+
+   return hdr_len;
+}
+#endif
+
 /*
  *-----------------------------------------------------------------------------
  * vxn_startl --
@@ -1023,6 +1307,11 @@ vxn_startl(struct ifnet *ifp)
 {
    vxn_softc_t *sc = ifp->if_softc;
    Vmxnet2_DriverData *dd = sc->vxn_dd;
+#ifdef CO_DO_TSO
+   int hdrlen = 0;
+   int pktlen = 0;
+   int mss = 0;
+#endif
 
    VXN_LOCK_ASSERT(sc);
 
@@ -1037,6 +1326,10 @@ vxn_startl(struct ifnet *ifp)
       dd->txStopped = TRUE;
    }
 
+#ifdef CO_USE_NEW_ALTQ
+   IFQ_LOCK( &ifp->if_snd );
+#endif
+
    /*
     * Dequeue packets from send queue and drop them into tx ring
     */
@@ -1044,14 +1337,30 @@ vxn_startl(struct ifnet *ifp)
       struct mbuf *m_head = NULL;
       Vmxnet2_TxRingEntry *xre;
 
-      IF_DEQUEUE(&ifp->if_snd, m_head);
+#ifdef CO_USE_NEW_ALTQ
+      IFQ_POLL_NOLOCK( &ifp->if_snd, m_head );
+#else
+      IF_DEQUEUE( &ifp->if_snd, m_head );
+#endif
       if (m_head == NULL) {
          break;
       }
 
+#ifdef CO_DO_TSO
+      if( ifp->if_capenable & IFCAP_TSO ) {
+         mss = m_head->m_pkthdr.tso_segsz;
+         if( mss ) {
+            pktlen = m_head->m_pkthdr.len;
+            hdrlen = vxn_get_hdrlen( ifp, m_head );
+         }
+      }
+#endif
+
       xre = &sc->vxn_tx_ring[dd->txDriverNext];
       if (vxn_encap(ifp, xre, m_head, &(sc->vxn_tx_buffptr[dd->txDriverNext]))) {
+#ifndef CO_USE_NEW_ALTQ
          IF_PREPEND(&ifp->if_snd, m_head);
+#endif
          break;
       }
 
@@ -1064,11 +1373,26 @@ vxn_startl(struct ifnet *ifp)
          xre->flags |= VMXNET2_TX_RING_LOW;
       }
 
-      VMXNET_INC(dd->txDriverNext, dd->txRingLength);
-      dd->txNumDeferred++;
-      sc->vxn_tx_pending++;
+#ifdef CO_DO_TSO
+      if( (ifp->if_capenable & IFCAP_TSO) && mss && pktlen ) {
+         dd->txNumDeferred += ((pktlen - hdrlen) + mss - 1) / mss;
+         xre->flags |= VMXNET2_TX_TSO;
+         xre->tsoMss = mss;
+      } else
+#endif
+      {
+         dd->txNumDeferred++;
+      }
+
+      ifp->if_obytes += m_head->m_pkthdr.len;
       ifp->if_opackets++;
+      VMXNET_INC(dd->txDriverNext, dd->txRingLength);
+      sc->vxn_tx_pending++;
    }
+
+#ifdef CO_USE_NEW_ALTQ
+   IFQ_UNLOCK( &ifp->if_snd );
+#endif
 
    /*
     * Transmit, if number of pending packets > tx cluster length
@@ -1082,6 +1406,8 @@ vxn_startl(struct ifnet *ifp)
        */
       bus_space_read_4(sc->vxn_iobtag, sc->vxn_iobhandle, VMXNET_TX_ADDR);
    }
+
+   sc->vxn_timer = 5;
 
    /*
     * Clean up tx ring after calling into vmkernel, as TX completion intrs
@@ -1108,22 +1434,56 @@ vxn_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
    int error = 0;
    int s;
    vxn_softc_t *sc = ifp->if_softc;
+   struct ifreq *ifr = (struct ifreq *)data;
 
    s = splimp();
 
    switch(command) {
    case SIOCSIFADDR:
    case SIOCGIFADDR:
-   case SIOCSIFMTU:
       error = ether_ioctl(ifp, command, data);
       break;
 
+   case SIOCSIFMTU:
+      VXN_LOCK(sc);
+      if ((ifr->ifr_mtu < VMXNET_MIN_MTU) || (ifr->ifr_mtu > VMXNET_MAX_MTU)) {
+         error = EINVAL;
+      }
+      else if (ifr->ifr_mtu > 1500 && !(ifp->if_capabilities & IFCAP_JUMBO_MTU) ) {
+         error = EINVAL;
+      }
+      else {
+         if( (ifp->if_mtu <= 1500) && (ifr->ifr_mtu > 1500) ) {
+            // not jumbo to jumbo
+            vxn_stopl(sc);
+            ifp->if_capenable |= IFCAP_JUMBO_MTU;
+            ifp->if_mtu = ifr->ifr_mtu;
+            vxn_initl(sc);
+         } else
+         if( (ifp->if_mtu > 1500) && (ifr->ifr_mtu <= 1500) ) {
+            // jumbo to not jumbo
+            vxn_stopl(sc);
+            ifp->if_capenable &= ~IFCAP_JUMBO_MTU;
+            ifp->if_mtu = ifr->ifr_mtu;
+            vxn_initl(sc);
+         } else {
+            ifp->if_mtu = ifr->ifr_mtu;
+         }
+         error = 0;
+      }
+      VXN_UNLOCK(sc);
+      break;
    case SIOCSIFFLAGS:
       VXN_LOCK(sc);
       if (ifp->if_flags & IFF_UP) {
          vxn_initl(sc);
       } else {
          vxn_stopl(sc);
+      }
+      if( ifp->if_flags & IFF_PROMISC ) {
+         sc->vxn_dd->ifflags |= VMXNET_IFF_PROMISC;
+      } else {
+         sc->vxn_dd->ifflags &= ~VMXNET_IFF_PROMISC;
       }
       VXN_UNLOCK(sc);
       break;
@@ -1134,6 +1494,30 @@ vxn_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
       vxn_load_multicast(sc);
       VXN_UNLOCK(sc);
       error = 0;
+      break;
+
+   case SIOCSIFCAP:
+      {
+         int mask = ifr->ifr_reqcap ^ ifp->if_capenable;
+         if( mask & IFCAP_TXCSUM ) {
+            ifp->if_capenable ^= IFCAP_TXCSUM;
+            if( (IFCAP_TXCSUM & ifp->if_capenable)
+             && (IFCAP_TXCSUM & ifp->if_capabilities) ) {
+            	ifp->if_hwassist = VMXNET_CSUM_FEATURES;
+            } else {
+            	ifp->if_hwassist = 0;
+            }
+         }
+         if( mask & IFCAP_RXCSUM ) {
+            ifp->if_capenable ^= IFCAP_RXCSUM;
+         }
+         if( mask & IFCAP_TSO4 ) {
+            ifp->if_capenable ^= IFCAP_TSO4;
+         }
+         if( mask & IFCAP_TSO6 ) {
+            ifp->if_capenable ^= IFCAP_TSO6;
+         }
+      }
       break;
 
    case SIOCSIFMEDIA:
@@ -1150,7 +1534,24 @@ vxn_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
    return error;
 }
 
-#if __FreeBSD_version < 900000
+#ifdef CO_USE_TICK
+static void
+vxn_watchdog(struct ifnet *ifp)
+{
+   vxn_softc_t *sc = ifp->if_softc;
+
+   VXN_LOCK_ASSERT(sc);
+
+   if( sc->vxn_timer == 0 || --sc->vxn_timer ) {
+      return;
+   }
+
+   ifp->if_oerrors++;
+
+   if_printf( ifp, "watchdog\n" );
+}
+#else
+#  if __FreeBSD_version < 900000
 /*
  *-----------------------------------------------------------------------------
  * vxn_watchdog --
@@ -1166,7 +1567,30 @@ vxn_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
 static void
 vxn_watchdog(struct ifnet *ifp)
 {
-   printf("vxn%d: watchdog\n", VXN_IF_UNIT(ifp));
+   if_printf( ifp, "watchdog\n" );
+}
+#  endif
+#endif
+
+#ifdef CO_USE_TICK
+static void
+vxn_tick(void *xsc)
+{
+   struct vxn_softc *sc = xsc;
+
+   VXN_LOCK_ASSERT(sc);
+
+    /* Synchronize with possible callout reset/stop. */
+   if( callout_pending( &sc->vxn_stat_ch ) ||
+      !callout_active( &sc->vxn_stat_ch ) ) {
+      return;
+   }
+
+   vxn_link_check( sc );
+
+   vxn_watchdog( VXN_SC2IFP(sc) );
+
+   callout_reset( &sc->vxn_stat_ch, hz, vxn_tick, sc );
 }
 #endif
 
@@ -1215,6 +1639,77 @@ vxn_intr (void *v)
    VXN_UNLOCK(sc);
 }
 
+#ifdef CO_DO_ZERO_COPY
+static void
+vxn_drop_frags( vxn_softc_t *sc )
+{
+   Vmxnet2_DriverData *dd = sc->vxn_dd;
+   Vmxnet2_RxRingEntry *rre2;
+   uint16 flags;
+
+   do {
+      rre2 = &sc->vxn_rx_ring2[dd->rxDriverNext2];
+      flags = rre2->flags;
+
+      rre2->ownership = VMXNET2_OWNERSHIP_NIC_FRAG;
+      VMXNET_INC(dd->rxDriverNext2, dd->rxRingLength2);
+   }  while(!(flags & VMXNET2_RX_FRAG_EOP));
+}
+
+static boolean_t
+vxn_rx_frags( vxn_softc_t *sc, struct mbuf *m )
+{
+   Vmxnet2_DriverData *dd = sc->vxn_dd;
+   Vmxnet2_RxRingEntry *rre2;
+   uint16 flags;
+   struct mbuf *m_top = m;
+
+   do {
+      rre2 = &sc->vxn_rx_ring2[dd->rxDriverNext2];
+      flags = rre2->flags;
+
+      if(rre2->ownership != VMXNET2_OWNERSHIP_DRIVER_FRAG) {
+          break;
+      }
+
+      if (rre2->actualLength > 0) {
+         struct mbuf *m_new = NULL;
+         struct mbuf *m2 = sc->vxn_rx_buffptr2[dd->rxDriverNext2];
+
+         /* refill the buffer */
+         MGET(m_new, M_DONTWAIT, MT_DATA);
+         if (m_new != NULL) {
+            MCLGET(m_new, M_DONTWAIT);
+            if (!(m_new->m_flags & M_EXT)) {
+            	m_freem(m_new);
+            	m_new = NULL;
+            }
+         }
+         if (m_new != NULL) {
+            m2->m_len = rre2->actualLength;
+            m->m_next = m2;
+            m2->m_next = NULL;
+            m = m2;
+            m_top->m_pkthdr.len += rre2->actualLength;
+
+            sc->vxn_rx_buffptr2[dd->rxDriverNext2] = m_new;
+            rre2->paddr = (uint64)vtophys(mtod(m_new, caddr_t));
+            rre2->bufferLength = MCLBYTES;
+            rre2->actualLength = 0;
+         } else {
+            vxn_drop_frags( sc );
+            return FALSE;
+         }
+      }
+
+      rre2->ownership = VMXNET2_OWNERSHIP_NIC_FRAG;
+      VMXNET_INC(dd->rxDriverNext2, dd->rxRingLength2);
+   } while (!(flags & VMXNET2_RX_FRAG_EOP));
+
+   return TRUE;
+}
+#endif
+
 /*
  *-----------------------------------------------------------------------------
  * vxn_rx --
@@ -1252,13 +1747,22 @@ vxn_rx(vxn_softc_t *sc)
       pkt_len = rre->actualLength;
 
       if (pkt_len < (60 - 4)) {
+#ifdef CO_DO_ZERO_COPY
+         if( ifp->if_capenable & IFCAP_JUMBO_MTU ) {
+            if( rre->flags & VMXNET2_RX_WITH_FRAG) {
+            	vxn_drop_frags( sc );
+            }
+         }
+#endif
+         ifp->if_ierrors++;
+
          /*
           * Ethernet header vlan tags are 4 bytes.  Some vendors generate
           *  60byte frames including vlan tags.  When vlan tag
           *  is stripped, such frames become 60 - 4. (PR106153)
           */
          if (pkt_len != 0) {
-            printf("vxn%d: runt packet\n", VXN_IF_UNIT(ifp));
+            if_printf( ifp, "runt packet\n" );
          }
       } else {
          struct mbuf *m_new = NULL;
@@ -1285,16 +1789,34 @@ vxn_rx(vxn_softc_t *sc)
             struct mbuf *m = sc->vxn_rx_buffptr[dd->rxDriverNext];
 
             sc->vxn_rx_buffptr[dd->rxDriverNext] = m_new;
-            rre->paddr = (uint32)vtophys(mtod(m_new, caddr_t));
+            rre->paddr = (uint64)vtophys(mtod(m_new, caddr_t));
+            rre->bufferLength = MCLBYTES - ETHER_ALIGN;
+            rre->actualLength = 0;
 
             ifp->if_ipackets++;
             m->m_pkthdr.rcvif = ifp;
             m->m_pkthdr.len = m->m_len = pkt_len;
 
-            if (rre->flags & VMXNET2_RX_HW_XSUM_OK) {
-               m->m_pkthdr.csum_flags |= CSUM_DATA_VALID | CSUM_PSEUDO_HDR;
-               m->m_pkthdr.csum_data = 0xffff;
+#ifdef CO_DO_ZERO_COPY
+            if( ifp->if_capenable & IFCAP_JUMBO_MTU ) {
+            	if( rre->flags & VMXNET2_RX_WITH_FRAG) {
+            		if( !vxn_rx_frags( sc, m ) ) {
+            			ifp->if_ierrors++;
+            			continue;
+            		}
+            	}
             }
+#endif
+
+            if( ifp->if_capenable & IFCAP_RXCSUM ) {
+            	if (rre->flags & VMXNET2_RX_HW_XSUM_OK) {
+            		m->m_pkthdr.csum_flags |= CSUM_DATA_VALID | CSUM_PSEUDO_HDR;
+            		m->m_pkthdr.csum_data = 0xffff;
+            		sc->vxn_csum_rx_ok_cnt++;
+            	}
+            }
+
+            ifp->if_ibytes += m->m_pkthdr.len;
 
             /*
              * "Drop the driver lock around calls to if_input to avoid a LOR
@@ -1310,6 +1832,16 @@ vxn_rx(vxn_softc_t *sc)
             VXN_UNLOCK(sc);
             VXN_ETHER_INPUT(ifp, m);
             VXN_LOCK(sc);
+         }
+         else {
+#ifdef CO_DO_ZERO_COPY
+            if( ifp->if_capenable & IFCAP_RXCSUM ) {
+            	if( rre->flags & VMXNET2_RX_WITH_FRAG) {
+            		vxn_drop_frags( sc );
+            	}
+            }
+#endif
+            ifp->if_ierrors++;
          }
       }
 
@@ -1352,6 +1884,10 @@ vxn_tx_complete(vxn_softc_t *sc)
       VMXNET_INC(dd->txDriverCur, dd->txRingLength);
       dd->txStopped = FALSE;
    }
+
+   if( sc->vxn_tx_pending == 0 ) {
+      sc->vxn_timer = 0;
+   }
 }
 
 /*
@@ -1370,21 +1906,26 @@ static int
 vxn_init_rings(vxn_softc_t *sc)
 {
    Vmxnet2_DriverData *dd = sc->vxn_dd;
-   /*struct ifnet *ifp = &sc->arpcom.ac_if;*/
+   struct ifnet *ifp = VXN_SC2IFP(sc);
    int i;
+   int j;
    int32 offset;
 
    offset = sizeof(*dd);
+
+   sc->vxn_num_rx_bufs = sc->vxn_num_rx_max_bufs;
+   sc->vxn_num_rx_bufs2 = sc->vxn_num_rx_max_bufs2;
+   sc->vxn_num_tx_bufs = sc->vxn_num_tx_max_bufs;
 
    dd->rxRingLength = sc->vxn_num_rx_bufs;
    dd->rxRingOffset = offset;
    sc->vxn_rx_ring = (Vmxnet2_RxRingEntry *)((uintptr_t)dd + offset);
    offset += sc->vxn_num_rx_bufs * sizeof(Vmxnet2_RxRingEntry);
 
-   /* dummy rxRing2, only used by windows */
-   dd->rxRingLength2 = 1;
+   dd->rxRingLength2 = sc->vxn_num_rx_bufs2;
    dd->rxRingOffset2 = offset;
-   offset += sizeof(Vmxnet2_RxRingEntry);
+   sc->vxn_rx_ring2 = (Vmxnet2_RxRingEntry *)((uintptr_t)dd + offset);
+   offset += sc->vxn_num_rx_bufs2 * sizeof(Vmxnet2_RxRingEntry);
 
    dd->txRingLength = sc->vxn_num_tx_bufs;
    dd->txRingOffset = offset;
@@ -1407,8 +1948,8 @@ vxn_init_rings(vxn_softc_t *sc)
          MCLGET(m_new, M_DONTWAIT);
          if (m_new->m_flags & M_EXT) {
             m_adj(m_new, ETHER_ALIGN);
-            sc->vxn_rx_ring[i].paddr = (uint32)vtophys(mtod(m_new, caddr_t));
-            sc->vxn_rx_ring[i].bufferLength = MCLBYTES;
+            sc->vxn_rx_ring[i].paddr = (uint64)vtophys(mtod(m_new, caddr_t));
+            sc->vxn_rx_ring[i].bufferLength = MCLBYTES -ETHER_ALIGN;
             sc->vxn_rx_ring[i].actualLength = 0;
             sc->vxn_rx_buffptr[i] = m_new;
             sc->vxn_rx_ring[i].ownership = VMXNET2_OWNERSHIP_NIC;
@@ -1426,14 +1967,58 @@ vxn_init_rings(vxn_softc_t *sc)
       }
    }
 
+#ifdef CO_DO_ZERO_COPY
+   if( ifp->if_capenable & IFCAP_JUMBO_MTU ) {
+      dd->maxFrags = 65536 / MCLBYTES +2;
+      for (j = 0; j < sc->vxn_num_rx_bufs2; j++) {
+         struct mbuf *m_new = NULL;
+
+         /*
+          * Allocate an mbuf and initialize it to contain a packet header and
+          * internal data.
+          */
+         MGET(m_new, M_DONTWAIT, MT_DATA);
+         if (m_new != NULL) {
+            /* Allocate and attach an mbuf cluster to mbuf. */
+//				m_cljget(m_new, M_DONTWAIT, MJUM9BYTES);
+            MCLGET(m_new, M_DONTWAIT);
+            if (m_new->m_flags & M_EXT) {
+            	sc->vxn_rx_ring2[j].paddr = (uint64)vtophys(mtod(m_new, caddr_t));
+//					sc->vxn_rx_ring2[j].bufferLength = MJUM9BYTES;
+            	sc->vxn_rx_ring2[j].bufferLength = MCLBYTES;
+            	sc->vxn_rx_ring2[j].actualLength = 0;
+            	sc->vxn_rx_buffptr2[j] = m_new;
+            	sc->vxn_rx_ring2[j].ownership = VMXNET2_OWNERSHIP_NIC_FRAG;
+            } else {
+            	/*
+            	 * Allocation and attachment of mbuf clusters failed.
+            	 */
+            	m_freem(m_new);
+            	m_new = NULL;
+            	goto err_release_ring2;
+            }
+         } else {
+            /* Allocation of mbuf failed. */
+            goto err_release_ring2;
+         }
+      }
+   } else {
+      for (j = 0; j < sc->vxn_num_rx_bufs2; j++) {
+         sc->vxn_rx_ring2[j].paddr = 0;
+         sc->vxn_rx_ring2[j].bufferLength = 0;
+         sc->vxn_rx_ring2[j].actualLength = 0;
+         sc->vxn_rx_buffptr2[j] = 0;
+         sc->vxn_rx_ring2[j].ownership = VMXNET2_OWNERSHIP_DRIVER;
+      }
+   }
+#else //!CO_DO_ZERO_COPY
    /* dummy rxRing2 tacked on to the end, with a single unusable entry */
    sc->vxn_rx_ring[i].paddr = 0;
    sc->vxn_rx_ring[i].bufferLength = 0;
    sc->vxn_rx_ring[i].actualLength = 0;
    sc->vxn_rx_buffptr[i] = 0;
    sc->vxn_rx_ring[i].ownership = VMXNET2_OWNERSHIP_DRIVER;
-
-   dd->rxDriverNext = 0;
+#endif //!CO_DO_ZERO_COPY
 
    /*
     * Give tx ring ownership to DRIVER
@@ -1441,14 +2026,24 @@ vxn_init_rings(vxn_softc_t *sc)
    for (i = 0; i < sc->vxn_num_tx_bufs; i++) {
       sc->vxn_tx_ring[i].ownership = VMXNET2_OWNERSHIP_DRIVER;
       sc->vxn_tx_buffptr[i] = NULL;
-      sc->vxn_tx_ring[i].sg.sg[0].addrHi = 0;
+      sc->vxn_tx_ring[i].sg.addrType = NET_SG_PHYS_ADDR;
    }
 
-   dd->txDriverCur = dd->txDriverNext = 0;
+//	dd->savedRxNICNext = dd->savedRxNICNext2 = dd->savedTxNICNext = 0;
    dd->txStopped = FALSE;
 
    sc->vxn_rings_allocated = 1;
    return 0;
+err_release_ring2:
+   if( ifp->if_capenable & IFCAP_JUMBO_MTU ) {
+      for (--j; j >= 0; j--) {
+         m_freem(sc->vxn_rx_buffptr2[j]);
+         sc->vxn_rx_buffptr2[j] = NULL;
+         sc->vxn_rx_ring2[j].paddr = 0;
+         sc->vxn_rx_ring2[j].bufferLength = 0;
+         sc->vxn_rx_ring2[j].ownership = 0;
+      }
+   }
 err_release_ring:
    /*
     * Clearup already allocated mbufs and attached clusters.
@@ -1479,6 +2074,7 @@ err_release_ring:
 static void
 vxn_release_rings(vxn_softc_t *sc)
 {
+   struct ifnet *ifp = VXN_SC2IFP(sc);
    int i;
 
    sc->vxn_rings_allocated = 0;
@@ -1490,6 +2086,18 @@ vxn_release_rings(vxn_softc_t *sc)
       if (sc->vxn_rx_buffptr[i] != NULL) {
          m_freem(sc->vxn_rx_buffptr[i]);
          sc->vxn_rx_buffptr[i] = NULL;
+      }
+   }
+
+   /*
+    * Free rx ring packets
+    */
+   if( ifp->if_capenable & IFCAP_JUMBO_MTU ) {
+      for (i = 0; i < sc->vxn_num_rx_bufs2; i++) {
+         if (sc->vxn_rx_buffptr2[i] != NULL) {
+            m_freem(sc->vxn_rx_buffptr2[i]);
+            sc->vxn_rx_buffptr2[i] = NULL;
+         }
       }
    }
 
